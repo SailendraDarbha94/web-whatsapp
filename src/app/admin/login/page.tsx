@@ -1,13 +1,16 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { FirebaseError } from "firebase/app";
 import { onAuthStateChanged, signInWithEmailAndPassword } from "firebase/auth";
 import { getFirebaseAuth } from "@/lib/firebase/firebaseConfig";
+import { useToast } from "@/contexts/toast-context";
 
 export default function AdminLoginPage() {
   const router = useRouter();
+  const { toast } = useToast();
   const [firebaseConfigError] = useState<string | null>(() => {
     try {
       getFirebaseAuth();
@@ -37,6 +40,7 @@ export default function AdminLoginPage() {
     try {
       const auth = getFirebaseAuth();
       await signInWithEmailAndPassword(auth, email.trim(), password);
+      toast("Signed in successfully.", "success");
       router.replace("/admin/dashboard");
     } catch (err) {
       if (err instanceof FirebaseError) {
@@ -50,8 +54,14 @@ export default function AdminLoginPage() {
   }
 
   return (
-    <div className="flex min-h-full flex-1 items-center justify-center px-4 py-16">
+    <div className="flex min-h-full flex-1 flex-col items-center justify-center px-4 py-16">
       <div className="w-full max-w-sm rounded-2xl border border-black/[0.08] bg-white px-8 py-10 shadow-sm dark:border-white/[0.12] dark:bg-zinc-950">
+        <Link
+          href="/"
+          className="mb-6 inline-flex text-sm font-medium text-zinc-600 underline-offset-4 transition hover:text-zinc-900 hover:underline dark:text-zinc-400 dark:hover:text-zinc-100"
+        >
+          ← Back to home
+        </Link>
         <h1 className="text-center text-xl font-semibold tracking-tight">
           Admin sign in
         </h1>
