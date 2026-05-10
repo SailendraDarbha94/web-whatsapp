@@ -33,6 +33,9 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 
+# local Firebase web config (secrets / project-specific)
+src/lib/firebase/firebaseConfig.ts
+
 # vercel
 .vercel
 
