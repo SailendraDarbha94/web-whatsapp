@@ -69,9 +69,13 @@ export async function sendWhatsAppMessage(payload: SendWhatsAppPayload) {
   const data = (await res.json().catch(() => null)) as GraphResponse | null;
 
   if (!res.ok) {
+    console.error(
+      "[whatsapp/cloud-api] Meta Graph API error:",
+      JSON.stringify({ httpStatus: res.status, body: data }, null, 2)
+    );
     const message = formatGraphError(data, res.status);
     const err = new Error(message) as Error & { status?: number; raw?: unknown };
-    // Map Meta 401/403 to 502 so clients don’t confuse WhatsApp token failures with Firebase 401
+    // Map Meta 401/403 to 502 so clients don't confuse WhatsApp token failures with Firebase 401
     err.status =
       res.status === 401 || res.status === 403 ? 502 : res.status;
     err.raw = data;
@@ -102,6 +106,15 @@ type GraphSuccessResponse = {
 function formatGraphError(data: GraphResponse | null, httpStatus: number): string {
   const rawMsg = data?.error?.message;
   const oauthCode = data?.error?.code;
+  const subcode = data?.error?.error_subcode;
+
+  const metaDetail = [
+    rawMsg && `message: ${rawMsg}`,
+    oauthCode != null && `code: ${oauthCode}`,
+    subcode != null && `subcode: ${subcode}`,
+  ]
+    .filter(Boolean)
+    .join(", ");
 
   if (
     httpStatus === 401 ||
@@ -113,11 +126,12 @@ function formatGraphError(data: GraphResponse | null, httpStatus: number): strin
     return (
       "WhatsApp API rejected the access token (WHATSAPP_ACCESS_TOKEN). " +
       "In Meta for Developers, open your app → WhatsApp → API setup: use a current System User or temporary token with whatsapp_business_messaging, " +
-      "and ensure WHATSAPP_PHONE_NUMBER_ID is the “Phone number ID” for that WhatsApp Business account. " +
-      (rawMsg && rawMsg !== "Authentication Error" ? `Meta said: ${rawMsg}` : "")
+      "and ensure WHATSAPP_PHONE_NUMBER_ID is the 'Phone number ID' for that WhatsApp Business account." +
+      (metaDetail ? ` Meta said: ${metaDetail}.` : "")
     ).trim();
   }
 
+  if (metaDetail) return `WhatsApp API error (HTTP ${httpStatus}): ${metaDetail}.`;
   if (rawMsg) return rawMsg;
   if (httpStatus >= 400) return `WhatsApp API error (HTTP ${httpStatus}).`;
   return "WhatsApp API request failed.";

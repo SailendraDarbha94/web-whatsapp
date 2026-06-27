@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
 import { verifyFirebaseIdToken } from "@/lib/firebase/admin";
-import { sendWhatsAppMessage } from "@/lib/whatsapp/cloud-api";
+import {
+  normalizeWhatsAppTo,
+  sendWhatsAppMessage,
+} from "@/lib/whatsapp/cloud-api";
+import { recordOutboundMessage } from "@/lib/whatsapp/store";
 
 export const runtime = "nodejs";
 
@@ -88,6 +92,7 @@ export async function POST(request: Request) {
         to,
         body: message,
       });
+      await persistOutbound(result, to, "text", message);
       return NextResponse.json({ ok: true, result });
     }
 
@@ -106,6 +111,7 @@ export async function POST(request: Request) {
       templateName,
       templateLanguage,
     });
+    await persistOutbound(result, to, "template", `[template: ${templateName}]`);
     return NextResponse.json({ ok: true, result });
   } catch (e: unknown) {
     const err = e as Error & { status?: number };
@@ -126,6 +132,27 @@ export async function POST(request: Request) {
         ? err.status
         : 502;
     return NextResponse.json({ error: message }, { status });
+  }
+}
+
+async function persistOutbound(
+  result: { messages?: { id?: string }[] } | null,
+  to: string,
+  type: string,
+  text: string
+): Promise<void> {
+  try {
+    const wamid = result?.messages?.[0]?.id;
+    if (!wamid) return;
+    await recordOutboundMessage({
+      wamid,
+      to: normalizeWhatsAppTo(to),
+      type,
+      text,
+    });
+  } catch (e) {
+    // Never fail the send because the local mirror write failed.
+    console.error("[api/whatsapp/send] failed to persist outbound:", e);
   }
 }
 

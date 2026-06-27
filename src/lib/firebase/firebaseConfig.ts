@@ -6,6 +6,7 @@ import {
   type FirebaseOptions,
 } from "firebase/app";
 import { getAuth, type Auth } from "firebase/auth";
+import { getFirestore, type Firestore } from "firebase/firestore";
 
 function readFirebaseOptions(): FirebaseOptions {
   const apiKey = process.env.NEXT_PUBLIC_FIREBASE_API_KEY;
@@ -50,4 +51,8 @@ export function getFirebaseApp(): FirebaseApp {
 
 export function getFirebaseAuth(): Auth {
   return getAuth(getFirebaseApp());
+}
+
+export function getFirebaseFirestore(): Firestore {
+  return getFirestore(getFirebaseApp());
 }

@@ -5,6 +5,7 @@ import {
   type App,
 } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
+import { getFirestore, type Firestore } from "firebase-admin/firestore";
 
 function getAdminApp(): App {
   const existing = getApps()[0];
@@ -43,4 +44,14 @@ function getAdminApp(): App {
 
 export async function verifyFirebaseIdToken(idToken: string) {
   return getAuth(getAdminApp()).verifyIdToken(idToken);
+}
+
+let firestoreInstance: Firestore | undefined;
+
+/** Server-side Firestore handle (Admin SDK). Bypasses security rules. */
+export function getAdminFirestore(): Firestore {
+  if (!firestoreInstance) {
+    firestoreInstance = getFirestore(getAdminApp());
+  }
+  return firestoreInstance;
 }
