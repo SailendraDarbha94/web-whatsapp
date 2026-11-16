@@ -16,6 +16,8 @@ import {
   getFirebaseFirestore,
 } from "@/lib/firebase/firebaseConfig";
 import { useToast } from "@/contexts/toast-context";
+import { MessageBody, type ThreadMessage } from "@/components/whatsapp/message-body";
+import { isMediaContent, type EditContent } from "@/lib/whatsapp/message-content";
 
 type Conversation = {
   waId: string;
@@ -27,15 +29,41 @@ type Conversation = {
   unreadCount?: number;
 };
 
-type Message = {
-  id: string;
-  direction: "in" | "out";
-  type: string;
-  text?: string | null;
+type Message = ThreadMessage & {
   status?: string;
   errorTitle?: string;
   timestamp?: Timestamp;
+  createdAt?: Timestamp;
 };
+
+/** [sent at, stored at]: send time, with the server write time breaking same-second ties. */
+type EventOrder = [number, number];
+type ThreadEvent<T> = { at: EventOrder; value: T };
+
+function eventOrder(m: Message): EventOrder {
+  return [toMillis(m.timestamp) ?? 0, toMillis(m.createdAt) ?? 0];
+}
+
+function keepNewest<T>(
+  events: Map<string, ThreadEvent<T>>,
+  key: string,
+  at: EventOrder,
+  value: T
+): void {
+  const prev = events.get(key);
+  if (!prev || at[0] > prev.at[0] || (at[0] === prev.at[0] && at[1] >= prev.at[1])) {
+    events.set(key, { at, value });
+  }
+}
+
+/** Show an edited message with its new text or caption (the media itself can't change). */
+function applyEdit(m: Message, edit: EditContent): Message {
+  if (edit.text !== undefined) return { ...m, text: edit.text };
+  if (edit.content && isMediaContent(m.content)) {
+    return { ...m, content: { ...m.content, caption: edit.content.caption } };
+  }
+  return m;
+}
 
 function toMillis(ts?: Timestamp): number | undefined {
   try {
@@ -156,14 +184,59 @@ export default function InboxPage() {
     return () => unsub();
   }, [ready, selectedId]);
 
+  // Jump straight to the newest message when a thread opens, so the
+  // lazy-loaded photos above it aren't all scrolled past (and downloaded).
+  // Afterwards, follow new messages only while the operator is at the bottom,
+  // instead of pulling them out of the history they are reading.
+  const scrolledThreadRef = useRef<string | null>(null);
   useEffect(() => {
-    threadEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    const end = threadEndRef.current;
+    if (messages.length === 0 || !end) {
+      scrolledThreadRef.current = null;
+      return;
+    }
+    const opening = scrolledThreadRef.current !== selectedId;
+    scrolledThreadRef.current = selectedId;
+    if (opening) {
+      end.scrollIntoView({ behavior: "auto" });
+    } else if (end.getBoundingClientRect().top - window.innerHeight < 400) {
+      end.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [messages, selectedId]);
 
   const selected = useMemo(
     () => conversations.find((c) => c.waId === selectedId) ?? null,
     [conversations, selectedId]
   );
+
+  // Index the thread for reply quotes, and fold reactions, edits and
+  // deletions onto the message they refer to (the newest event wins; a
+  // reaction without an emoji removes it). Events whose target isn't in the
+  // loaded thread stay visible as their own line.
+  const thread = useMemo(() => {
+    const byId = new Map<string, Message>();
+    for (const m of messages) byId.set(m.id, m);
+    const folded = new Set<string>();
+    const reactions = new Map<string, ThreadEvent<string | undefined>>();
+    const edits = new Map<string, ThreadEvent<EditContent>>();
+    const deleted = new Set<string>();
+    for (const m of messages) {
+      const content = m.content;
+      if (!content) continue;
+      const targetId =
+        content.type === "reaction"
+          ? content.messageId
+          : content.type === "edit" || content.type === "revoke"
+            ? content.originalMessageId
+            : undefined;
+      if (!targetId || !byId.has(targetId)) continue;
+      folded.add(m.id);
+      if (content.type === "reaction") keepNewest(reactions, targetId, eventOrder(m), content.emoji);
+      else if (content.type === "edit") keepNewest(edits, targetId, eventOrder(m), content);
+      else deleted.add(targetId);
+    }
+    return { byId, folded, reactions, edits, deleted };
+  }, [messages]);
 
   const windowOpen = useMemo(() => {
     const expires = toMillis(selected?.serviceWindowExpiresAt);
@@ -292,7 +365,7 @@ export default function InboxPage() {
                       <div className="flex items-center justify-between gap-2">
                         <span className="truncate text-xs text-zinc-500 dark:text-zinc-400">
                           {c.lastDirection === "out" ? "You: " : ""}
-                          {c.lastMessageText ?? ""}
+                          {typeof c.lastMessageText === "string" ? c.lastMessageText : ""}
                         </span>
                         {unread > 0 && (
                           <span className="flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full bg-emerald-600 px-1.5 text-[11px] font-medium text-white">
@@ -342,30 +415,61 @@ export default function InboxPage() {
 
               <div className="flex-1 space-y-2 overflow-y-auto px-4 py-4">
                 {messages.map((m) => {
+                  if (thread.folded.has(m.id)) return null;
                   const out = m.direction === "out";
+                  const reaction = thread.reactions.get(m.id)?.value;
+                  const edit = thread.edits.get(m.id)?.value;
+                  const quotedId = m.context?.messageId;
+                  const quoted = quotedId ? thread.byId.get(quotedId) : undefined;
+                  const quotedEdit = quoted ? thread.edits.get(quoted.id)?.value : undefined;
                   return (
                     <div
                       key={m.id}
-                      className={`flex ${out ? "justify-end" : "justify-start"}`}
+                      className={`flex ${out ? "justify-end" : "justify-start"} ${
+                        reaction ? "pb-4" : ""
+                      }`}
                     >
                       <div
-                        className={`max-w-[75%] rounded-2xl px-3 py-2 text-sm ${
+                        className={`relative max-w-[75%] rounded-2xl px-3 py-2 text-sm ${
                           out
                             ? "bg-emerald-600 text-white"
                             : "bg-zinc-100 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100"
                         }`}
                       >
-                        <p className="whitespace-pre-wrap break-words">
-                          {m.text || `[${m.type}]`}
-                        </p>
+                        <MessageBody
+                          conversationId={selected.waId}
+                          message={edit ? applyEdit(m, edit) : m}
+                          quoted={
+                            quoted ? (quotedEdit ? applyEdit(quoted, quotedEdit) : quoted) : null
+                          }
+                          customerLabel={selected.name || `+${selected.waId}`}
+                          sentAtMs={toMillis(m.timestamp)}
+                          deleted={thread.deleted.has(m.id)}
+                        />
+                        {reaction && (
+                          <span
+                            className={`absolute -bottom-4 ${
+                              out ? "right-3" : "left-3"
+                            } rounded-full border border-black/10 bg-white px-1.5 text-[13px] leading-5 shadow-sm dark:border-white/10 dark:bg-zinc-900`}
+                            title="Customer's reaction"
+                          >
+                            {reaction}
+                          </span>
+                        )}
                         <div
                           className={`mt-1 flex items-center justify-end gap-1 text-[10px] ${
                             out ? "text-emerald-100" : "text-zinc-400"
                           }`}
                         >
                           <span>{formatTime(m.timestamp)}</span>
-                          {out && m.status && (
-                            <span>· {STATUS_LABEL[m.status] ?? m.status}</span>
+                          {edit && <span>· Edited</span>}
+                          {out && typeof m.status === "string" && m.status && (
+                            <span>
+                              ·{" "}
+                              {Object.hasOwn(STATUS_LABEL, m.status)
+                                ? STATUS_LABEL[m.status]
+                                : m.status}
+                            </span>
                           )}
                         </div>
                         {out && m.status === "failed" && m.errorTitle && (
