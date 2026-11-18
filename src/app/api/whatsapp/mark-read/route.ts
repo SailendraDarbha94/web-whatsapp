@@ -1,31 +1,17 @@
 import { NextResponse } from "next/server";
-import { verifyFirebaseIdToken } from "@/lib/firebase/admin";
+import { authorizeOperator } from "@/lib/firebase/operator-auth";
+import { isConversationId } from "@/lib/whatsapp/ids";
 import { markConversationRead } from "@/lib/whatsapp/store";
 
 export const runtime = "nodejs";
 
-type Body = { waId?: string };
+/** `waId` is the older name for `conversationId`; both are accepted. */
+type Body = { conversationId?: unknown; waId?: unknown };
 
 export async function POST(request: Request) {
-  const authHeader = request.headers.get("authorization");
-  const idToken =
-    authHeader && authHeader.startsWith("Bearer ")
-      ? authHeader.slice(7).trim()
-      : "";
-  if (!idToken) {
-    return NextResponse.json(
-      { error: "Missing or invalid Authorization header." },
-      { status: 401 }
-    );
-  }
-
-  try {
-    await verifyFirebaseIdToken(idToken);
-  } catch {
-    return NextResponse.json(
-      { error: "Invalid or expired session." },
-      { status: 401 }
-    );
+  const auth = await authorizeOperator(request);
+  if (!auth.ok) {
+    return NextResponse.json({ error: auth.error }, { status: auth.status });
   }
 
   let json: Body;
@@ -35,13 +21,17 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
-  const waId = typeof json.waId === "string" ? json.waId.trim() : "";
-  if (!waId) {
-    return NextResponse.json({ error: "Field `waId` is required." }, { status: 400 });
+  const raw = json?.conversationId ?? json?.waId;
+  const conversationId = typeof raw === "string" ? raw.trim() : "";
+  if (!isConversationId(conversationId)) {
+    return NextResponse.json(
+      { error: "Field `conversationId` must be a conversation id." },
+      { status: 400 }
+    );
   }
 
   try {
-    await markConversationRead(waId);
+    await markConversationRead(conversationId);
     return NextResponse.json({ ok: true });
   } catch (e) {
     console.error("[api/whatsapp/mark-read] failed:", e);

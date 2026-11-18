@@ -40,18 +40,35 @@ export type StatusUpdate = {
   id: string;
   status: string;
   timestamp: string;
+  /** Customer's wa_id; omitted for customers who haven't shared their number. */
   recipientId?: string;
+  /** Customer's business-scoped user id (BSUID). */
+  recipientUserId?: string;
   errorTitle?: string;
   errorCode?: number;
   raw: Record<string, unknown>;
 };
 
+/** What the payload's `contacts` say about a customer. */
+export type ContactProfile = { name?: string; username?: string };
+
 export type ParsedMessagesPayload = {
   inbound: InboundMessage[];
   statuses: StatusUpdate[];
-  /** Map of wa_id → display name pulled from the payload's `contacts`. */
-  contacts: Record<string, string>;
+  /** Profiles from the payload's `contacts`, by wa_id and by BSUID. */
+  contacts: Map<string, ContactProfile>;
 };
+
+/** The profile Meta sent along with a message, looked up by number, then by BSUID. */
+export function profileFor(
+  contacts: Map<string, ContactProfile>,
+  message: Pick<InboundMessage, "from" | "fromUserId">
+): ContactProfile | undefined {
+  return (
+    (message.from ? contacts.get(message.from) : undefined) ??
+    (message.fromUserId ? contacts.get(message.fromUserId) : undefined)
+  );
+}
 
 /**
  * Verify Meta's X-Hub-Signature-256 header against the raw request body.
@@ -93,7 +110,7 @@ type GraphWebhookBody = {
 export function parseMessagesPayload(body: unknown): ParsedMessagesPayload {
   const inbound: InboundMessage[] = [];
   const statuses: StatusUpdate[] = [];
-  const contacts: Record<string, string> = {};
+  const contacts = new Map<string, ContactProfile>();
 
   // External input: skip anything that isn't shaped as documented instead of
   // throwing, so one malformed item can't drop the rest of the payload.
@@ -105,12 +122,16 @@ export function parseMessagesPayload(body: unknown): ParsedMessagesPayload {
       if (!value) continue;
 
       for (const c of records(value.contacts)) {
-        const waId = c.wa_id != null ? String(c.wa_id) : "";
-        const name =
-          isRecord(c.profile) && (c.profile as Record<string, unknown>).name
-            ? String((c.profile as Record<string, unknown>).name)
-            : "";
-        if (waId && name) contacts[waId] = name;
+        const profile = rec(c.profile);
+        const details = defined({
+          name: str(profile?.name),
+          username: str(profile?.username),
+        });
+        if (!hasFields(details)) continue;
+        const waId = str(c.wa_id);
+        const userId = str(c.user_id);
+        if (waId) contacts.set(waId, details);
+        if (userId) contacts.set(userId, details);
       }
 
       for (const m of records(value.messages)) {
@@ -143,8 +164,8 @@ export function parseMessagesPayload(body: unknown): ParsedMessagesPayload {
           id: String(s.id ?? ""),
           status: String(s.status ?? ""),
           timestamp: String(s.timestamp ?? ""),
-          recipientId:
-            s.recipient_id != null ? String(s.recipient_id) : undefined,
+          recipientId: str(s.recipient_id),
+          recipientUserId: str(s.recipient_user_id),
           errorTitle: firstError
             ? String(firstError.title ?? firstError.message ?? "")
             : undefined,
@@ -364,6 +385,8 @@ function normalizeContent(
         systemType: str(system.type),
         body: str(system.body),
         newWaId: str(system.new_wa_id) ?? str(system.wa_id),
+        userId: str(system.user_id),
+        previousUserId: str(system.previous_user_id),
       });
     }
 

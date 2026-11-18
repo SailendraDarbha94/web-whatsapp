@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { verifyFirebaseIdToken } from "@/lib/firebase/admin";
+import { authorizeOperator } from "@/lib/firebase/operator-auth";
 import { fetchWhatsAppMedia, WhatsAppMediaError } from "@/lib/whatsapp/cloud-api";
+import { isConversationId, isValidDocumentId } from "@/lib/whatsapp/ids";
 import { getInboundMedia } from "@/lib/whatsapp/store";
 
 export const runtime = "nodejs";
@@ -24,39 +25,24 @@ const INLINE_TYPES = new Set([
   "video/3gpp",
 ]);
 
-/** Conversation ids are WhatsApp ids: digits only. */
-const WA_ID_PATTERN = /^\d{5,20}$/;
-
 /**
- * GET /api/whatsapp/media?conversation={waId}&message={wamid}
+ * GET /api/whatsapp/media?conversation={conversationId}&message={wamid}
  *
  * Streams the media attached to a stored inbound message. The media id comes
  * from Firestore, not from the caller, so this can't be used to fetch
- * arbitrary media with the business token. Requires a Firebase ID token in
- * `Authorization: Bearer …`.
+ * arbitrary media with the business token. Requires an operator's Firebase ID
+ * token in `Authorization: Bearer …`.
  */
 export async function GET(request: NextRequest) {
-  const idToken = extractBearerToken(request.headers.get("authorization"));
-  if (!idToken) {
-    return NextResponse.json(
-      { error: "Missing or invalid Authorization header." },
-      { status: 401 }
-    );
-  }
-
-  try {
-    await verifyFirebaseIdToken(idToken);
-  } catch {
-    return NextResponse.json(
-      { error: "Invalid or expired session." },
-      { status: 401 }
-    );
+  const auth = await authorizeOperator(request);
+  if (!auth.ok) {
+    return NextResponse.json({ error: auth.error }, { status: auth.status });
   }
 
   const params = request.nextUrl.searchParams;
   const waId = params.get("conversation") ?? "";
   const wamid = params.get("message") ?? "";
-  if (!WA_ID_PATTERN.test(waId) || !isValidDocumentId(wamid)) {
+  if (!isConversationId(waId) || !isValidDocumentId(wamid)) {
     return NextResponse.json(
       { error: "Invalid conversation or message id." },
       { status: 400 }
@@ -114,22 +100,4 @@ export function HEAD() {
 function servedContentType(raw: string | undefined): string {
   const base = raw?.split(";")[0]?.trim().toLowerCase();
   return base && INLINE_TYPES.has(base) ? base : "application/octet-stream";
-}
-
-/** Firestore document ids can't contain "/", be "." or "..", or look like __x__. */
-function isValidDocumentId(id: string): boolean {
-  return (
-    id.length > 0 &&
-    id.length <= 512 &&
-    !id.includes("/") &&
-    id !== "." &&
-    id !== ".." &&
-    !/^__.*__$/.test(id)
-  );
-}
-
-function extractBearerToken(header: string | null): string | null {
-  if (!header || !header.startsWith("Bearer ")) return null;
-  const token = header.slice(7).trim();
-  return token.length ? token : null;
 }

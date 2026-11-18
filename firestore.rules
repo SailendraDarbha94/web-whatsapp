@@ -1,21 +1,32 @@
 rules_version = '2';
 
 // WhatsApp inbox data model:
-//   conversations/{waId}
-//   conversations/{waId}/messages/{wamid}
+//   conversations/{customerId}
+//   conversations/{customerId}/messages/{wamid}
 //
 // All writes happen server-side through the Firebase Admin SDK (webhook +
 // send routes), which bypasses these rules entirely. Browsers only ever read,
-// and only when signed in. The "mark read" action also goes through an
-// authenticated server route, so clients never need write access here.
+// and only operators: accounts with the `operator` custom claim, granted with
+// `npm run operators -- grant <email>`. Being signed in isn't enough, because
+// anyone can create an account from the public web config unless sign-up is
+// disabled in Firebase Authentication.
+//
+// Deploy: Firebase console → Firestore Database → Rules → paste this file →
+// Publish, or `npx firebase-tools deploy --only firestore:rules --project <project-id>`
+// (firebase.json points here). Afterwards, check the live rules mention
+// request.auth.token.operator.
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /conversations/{waId} {
-      allow read: if request.auth != null;
+    function isOperator() {
+      return request.auth != null && request.auth.token.operator == true;
+    }
+
+    match /conversations/{customerId} {
+      allow read: if isOperator();
       allow write: if false;
 
       match /messages/{wamid} {
-        allow read: if request.auth != null;
+        allow read: if isOperator();
         allow write: if false;
       }
     }

@@ -4,7 +4,7 @@ import {
   initializeApp,
   type App,
 } from "firebase-admin/app";
-import { getAuth } from "firebase-admin/auth";
+import { getAuth, type Auth } from "firebase-admin/auth";
 import { getFirestore, type Firestore } from "firebase-admin/firestore";
 
 function getAdminApp(): App {
@@ -42,8 +42,9 @@ function getAdminApp(): App {
   }
 }
 
-export async function verifyFirebaseIdToken(idToken: string) {
-  return getAuth(getAdminApp()).verifyIdToken(idToken);
+/** Server-side Auth handle (Admin SDK). Use authorizeOperator() to check API callers. */
+export function getAdminAuth(): Auth {
+  return getAuth(getAdminApp());
 }
 
 let firestoreInstance: Firestore | undefined;

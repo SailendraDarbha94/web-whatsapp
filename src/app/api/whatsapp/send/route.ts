@@ -1,79 +1,79 @@
 import { NextResponse } from "next/server";
-import { verifyFirebaseIdToken } from "@/lib/firebase/admin";
+import { authorizeOperator } from "@/lib/firebase/operator-auth";
 import {
-  normalizeWhatsAppTo,
+  formatRecipient,
+  parseTypedRecipient,
   sendWhatsAppMessage,
+  type GraphSuccessResponse,
+  type WhatsAppRecipient,
 } from "@/lib/whatsapp/cloud-api";
-import { recordOutboundMessage } from "@/lib/whatsapp/store";
+import { isConversationId, isPhoneId } from "@/lib/whatsapp/ids";
+import {
+  getConversationRecipient,
+  recordOutboundMessage,
+  type ReplyTarget,
+} from "@/lib/whatsapp/store";
 
 export const runtime = "nodejs";
 
 type Body = {
-  to?: string;
-  mode?: "text" | "template";
-  message?: string;
-  templateName?: string;
-  templateLanguage?: string;
+  /** Reply in an existing conversation (the inbox): the server picks the customer's current id. */
+  conversationId?: unknown;
+  /** A number typed by an operator, in international format, or a BSUID. */
+  to?: unknown;
+  mode?: unknown;
+  message?: unknown;
+  templateName?: unknown;
+  templateLanguage?: unknown;
 };
 
+type Target = { recipient: WhatsAppRecipient; conversationId?: string };
+
 export async function POST(request: Request) {
-  const authHeader = request.headers.get("authorization");
-  const idToken = extractBearerToken(authHeader);
-  if (!idToken) {
-    return NextResponse.json(
-      { error: "Missing or invalid Authorization header." },
-      { status: 401 }
-    );
-  }
-
-  try {
-    await verifyFirebaseIdToken(idToken);
-  } catch (e: unknown) {
-    const info = getErrorInfo(e);
-    const msg = info.message;
-
-    if (msg.includes("FIREBASE_ADMIN_CREDENTIALS_INVALID")) {
-      return NextResponse.json(
-        {
-          error:
-            "Firebase Admin private key is invalid or malformed. Re-copy private_key from the service account JSON into .env.local (one line in double quotes, \\n as in JSON).",
-        },
-        { status: 500 }
-      );
-    }
-    if (
-      msg.includes("Firebase Admin env not loaded") ||
-      msg.includes("Missing FIREBASE_ADMIN_PROJECT_ID")
-    ) {
-      return NextResponse.json({ error: msg }, { status: 500 });
-    }
-
-    const devHint =
-      process.env.NODE_ENV === "development"
-        ? ` (${info.code ? info.code + ": " : ""}${msg})`
-        : "";
-    const audienceMismatch =
-      /audience|claim.*aud|incorrect.*aud/i.test(msg) || /\baud\b/i.test(msg);
-    const userMessage = audienceMismatch
-      ? "Firebase project mismatch: use the same project in client config (firebaseConfig) and FIREBASE_ADMIN_PROJECT_ID." +
-        devHint
-      : "Invalid or expired session. Sign out and sign in again." + devHint;
-
-    console.error("[api/whatsapp/send] ID token verification failed:", info.code, msg);
-
-    return NextResponse.json({ error: userMessage }, { status: 401 });
+  const auth = await authorizeOperator(request);
+  if (!auth.ok) {
+    return NextResponse.json({ error: auth.error }, { status: auth.status });
   }
 
   let json: Body;
   try {
-    json = (await request.json()) as Body;
+    json = ((await request.json()) ?? {}) as Body;
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
-  const to = typeof json.to === "string" ? json.to.trim() : "";
-  if (!to) {
-    return NextResponse.json({ error: "Field `to` is required." }, { status: 400 });
+  let target: Target;
+  if (typeof json.conversationId === "string" && json.conversationId.trim()) {
+    const conversationId = json.conversationId.trim();
+    if (!isConversationId(conversationId)) {
+      return NextResponse.json({ error: "Invalid conversation id." }, { status: 400 });
+    }
+    let reply: ReplyTarget | null;
+    try {
+      reply = await getConversationRecipient(conversationId);
+    } catch (e) {
+      console.error("[api/whatsapp/send] conversation lookup failed:", e);
+      return NextResponse.json({ error: "Could not look up the conversation." }, { status: 500 });
+    }
+    if (!reply) {
+      return NextResponse.json({ error: "Conversation not found." }, { status: 404 });
+    }
+    if (!reply.ok) {
+      // The customer moved to another thread, or their number was reassigned.
+      return NextResponse.json({ error: reply.error }, { status: 409 });
+    }
+    target = { recipient: reply.recipient, conversationId };
+  } else {
+    const to = typeof json.to === "string" ? json.to.trim() : "";
+    if (!to) {
+      return NextResponse.json({ error: "Field `to` is required." }, { status: 400 });
+    }
+    try {
+      target = { recipient: parseTypedRecipient(to) };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Invalid phone number.";
+      return NextResponse.json({ error: message }, { status: 400 });
+    }
   }
 
   const mode = json.mode === "template" ? "template" : "text";
@@ -87,19 +87,18 @@ export async function POST(request: Request) {
           { status: 400 }
         );
       }
-      const result = await sendWhatsAppMessage({
-        mode: "text",
-        to,
-        body: message,
-      });
-      await persistOutbound(result, to, "text", message);
-      return NextResponse.json({ ok: true, result });
+      const result = await sendWhatsAppMessage({ mode: "text", recipient: target.recipient, body: message });
+      await persistOutbound(result, target, "text", message, auth.uid);
+      return NextResponse.json({ ok: true, to: formatRecipient(target.recipient), result });
     }
 
-    const templateName =
-      typeof json.templateName === "string" && json.templateName.trim()
-        ? json.templateName.trim()
-        : "hello_world";
+    const templateName = typeof json.templateName === "string" ? json.templateName.trim() : "";
+    if (!templateName) {
+      return NextResponse.json(
+        { error: "Field `templateName` is required for template mode." },
+        { status: 400 }
+      );
+    }
     const templateLanguage =
       typeof json.templateLanguage === "string" && json.templateLanguage.trim()
         ? json.templateLanguage.trim()
@@ -107,25 +106,18 @@ export async function POST(request: Request) {
 
     const result = await sendWhatsAppMessage({
       mode: "template",
-      to,
+      recipient: target.recipient,
       templateName,
       templateLanguage,
     });
-    await persistOutbound(result, to, "template", `[template: ${templateName}]`);
-    return NextResponse.json({ ok: true, result });
+    await persistOutbound(result, target, "template", `[template: ${templateName}]`, auth.uid);
+    return NextResponse.json({ ok: true, to: formatRecipient(target.recipient), result });
   } catch (e: unknown) {
     const err = e as Error & { status?: number };
     const message = err.message || "Request failed.";
-    if (
-      message.includes("WhatsApp env not loaded") ||
-      message.includes("WHATSAPP_PHONE_NUMBER_ID") ||
-      message.includes("WHATSAPP_ACCESS_TOKEN")
-    ) {
+    if (message.includes("WhatsApp env not loaded")) {
       console.error("WhatsApp send configuration:", message);
       return NextResponse.json({ error: message }, { status: 500 });
-    }
-    if (message.includes("Invalid phone number")) {
-      return NextResponse.json({ error: message }, { status: 400 });
     }
     const status =
       typeof err.status === "number" && err.status >= 400 && err.status <= 599
@@ -135,40 +127,46 @@ export async function POST(request: Request) {
   }
 }
 
+/**
+ * A reply stays in its conversation. A message to a typed number goes to the
+ * conversation for the wa_id Meta resolved the number to (the id the
+ * customer's replies arrive with), or for the BSUID.
+ */
+function conversationFor(
+  target: Target,
+  result: GraphSuccessResponse | null
+): { conversationId: string; exact: boolean; userIdHint?: string } {
+  if (target.conversationId) return { conversationId: target.conversationId, exact: true };
+  const { recipient } = target;
+  if (recipient.kind === "user") return { conversationId: recipient.userId, exact: false };
+  const contact = result?.contacts?.[0];
+  const waId = contact?.wa_id;
+  return {
+    conversationId: typeof waId === "string" && isPhoneId(waId) ? waId : recipient.digits,
+    exact: false,
+    userIdHint: typeof contact?.user_id === "string" ? contact.user_id : undefined,
+  };
+}
+
 async function persistOutbound(
-  result: { messages?: { id?: string }[] } | null,
-  to: string,
+  result: GraphSuccessResponse | null,
+  target: Target,
   type: string,
-  text: string
+  text: string,
+  sentBy: string
 ): Promise<void> {
   try {
     const wamid = result?.messages?.[0]?.id;
     if (!wamid) return;
     await recordOutboundMessage({
       wamid,
-      to: normalizeWhatsAppTo(to),
+      ...conversationFor(target, result),
       type,
       text,
+      sentBy,
     });
   } catch (e) {
     // Never fail the send because the local mirror write failed.
     console.error("[api/whatsapp/send] failed to persist outbound:", e);
   }
-}
-
-function extractBearerToken(header: string | null): string | null {
-  if (!header || !header.startsWith("Bearer ")) return null;
-  const token = header.slice(7).trim();
-  return token.length ? token : null;
-}
-
-function getErrorInfo(e: unknown): { message: string; code?: string } {
-  if (typeof e === "object" && e !== null) {
-    const o = e as { message?: unknown; code?: unknown };
-    const message =
-      typeof o.message === "string" ? o.message : String(e);
-    const code = typeof o.code === "string" ? o.code : undefined;
-    return { message, code };
-  }
-  return { message: String(e) };
 }

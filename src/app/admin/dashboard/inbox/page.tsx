@@ -2,8 +2,6 @@
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { onAuthStateChanged } from "firebase/auth";
 import {
   collection,
   onSnapshot,
@@ -16,18 +14,33 @@ import {
   getFirebaseFirestore,
 } from "@/lib/firebase/firebaseConfig";
 import { useToast } from "@/contexts/toast-context";
+import { OperatorGate } from "@/components/admin/session-gate";
 import { MessageBody, type ThreadMessage } from "@/components/whatsapp/message-body";
+import { customerDetail, customerLabel } from "@/lib/whatsapp/ids";
 import { isMediaContent, type EditContent } from "@/lib/whatsapp/message-content";
 
 type Conversation = {
-  waId: string;
+  /** Document id: the customer's wa_id, or their BSUID if they haven't shared their number. */
+  id: string;
+  waId?: string;
+  userId?: string;
+  username?: string;
   name?: string;
   lastMessageText?: string;
   lastDirection?: "in" | "out";
   lastMessageAt?: Timestamp;
   serviceWindowExpiresAt?: Timestamp;
   unreadCount?: number;
+  previousWaIds?: string[];
+  /** The customer now writes from this other conversation (after a number change). */
+  continuedIn?: string;
+  /** A different WhatsApp account took over this customer's number. */
+  numberReassignedAt?: Timestamp;
 };
+
+type SendBody =
+  | { mode: "text"; message: string }
+  | { mode: "template"; templateName: string; templateLanguage: string };
 
 type Message = ThreadMessage & {
   status?: string;
@@ -97,38 +110,27 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 export default function InboxPage() {
-  const router = useRouter();
+  return (
+    <OperatorGate>
+      <Inbox />
+    </OperatorGate>
+  );
+}
+
+function Inbox() {
   const { toast } = useToast();
-  const [ready, setReady] = useState(false);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [reply, setReply] = useState("");
+  const [templateName, setTemplateName] = useState("");
+  const [templateLanguage, setTemplateLanguage] = useState("en_US");
   const [sending, setSending] = useState(false);
   const [nowMs, setNowMs] = useState(0);
   const threadEndRef = useRef<HTMLDivElement | null>(null);
 
-  useEffect(() => {
-    let auth;
-    try {
-      auth = getFirebaseAuth();
-    } catch {
-      router.replace("/admin/login");
-      return;
-    }
-    const unsub = onAuthStateChanged(auth, (user) => {
-      if (!user) {
-        router.replace("/admin/login");
-        return;
-      }
-      setReady(true);
-    });
-    return () => unsub();
-  }, [router]);
-
   // Subscribe to the conversation list.
   useEffect(() => {
-    if (!ready) return;
     const db = getFirebaseFirestore();
     const q = query(
       collection(db, "conversations"),
@@ -138,16 +140,22 @@ export default function InboxPage() {
       q,
       (snap) => {
         setConversations(
-          snap.docs.map((d) => ({ waId: d.id, ...(d.data() as object) }) as Conversation)
+          // The document id wins over any stored field of the same name.
+          snap.docs.map((d) => ({ ...(d.data() as object), id: d.id }) as Conversation)
         );
       },
       (err) => {
         console.error("[inbox] conversations listener error:", err);
-        toast("Could not load conversations. Check Firestore rules.", "error");
+        toast(
+          err.code === "permission-denied"
+            ? "Firestore refused access. Deploy firestore.rules and check this account has operator access."
+            : "Could not load conversations.",
+          "error"
+        );
       }
     );
     return () => unsub();
-  }, [ready, toast]);
+  }, [toast]);
 
   // Keep a clock ticking so the 24h reply window flips closed on its own,
   // without reading Date.now() during render. The interval callback is the
@@ -164,7 +172,7 @@ export default function InboxPage() {
 
   // Subscribe to the selected conversation's messages.
   useEffect(() => {
-    if (!ready || !selectedId) return;
+    if (!selectedId) return;
     const db = getFirebaseFirestore();
     const q = query(
       collection(db, "conversations", selectedId, "messages"),
@@ -182,7 +190,7 @@ export default function InboxPage() {
       }
     );
     return () => unsub();
-  }, [ready, selectedId]);
+  }, [selectedId]);
 
   // Jump straight to the newest message when a thread opens, so the
   // lazy-loaded photos above it aren't all scrolled past (and downloaded).
@@ -205,7 +213,7 @@ export default function InboxPage() {
   }, [messages, selectedId]);
 
   const selected = useMemo(
-    () => conversations.find((c) => c.waId === selectedId) ?? null,
+    () => conversations.find((c) => c.id === selectedId) ?? null,
     [conversations, selectedId]
   );
 
@@ -243,10 +251,10 @@ export default function InboxPage() {
     return expires != null && expires > nowMs;
   }, [selected, nowMs]);
 
-  async function selectConversation(waId: string) {
+  async function selectConversation(conversationId: string) {
     setMessages([]);
-    setSelectedId(waId);
-    const conv = conversations.find((c) => c.waId === waId);
+    setSelectedId(conversationId);
+    const conv = conversations.find((c) => c.id === conversationId);
     if (conv && (conv.unreadCount ?? 0) > 0) {
       try {
         const user = getFirebaseAuth().currentUser;
@@ -258,7 +266,7 @@ export default function InboxPage() {
             "Content-Type": "application/json",
             Authorization: `Bearer ${idToken}`,
           },
-          body: JSON.stringify({ waId }),
+          body: JSON.stringify({ conversationId }),
         });
       } catch {
         // Non-critical; the badge will simply linger.
@@ -266,13 +274,16 @@ export default function InboxPage() {
     }
   }
 
-  async function handleReply(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!selectedId || !reply.trim()) return;
+  /**
+   * Send to the selected conversation. The server picks the customer's
+   * current number or user id, so the thread's own id is all that's sent.
+   */
+  async function sendToSelected(body: SendBody): Promise<boolean> {
+    if (!selectedId) return false;
     const user = getFirebaseAuth().currentUser;
     if (!user) {
       toast("You are not signed in.", "error");
-      return;
+      return false;
     }
     setSending(true);
     try {
@@ -283,27 +294,37 @@ export default function InboxPage() {
           "Content-Type": "application/json",
           Authorization: `Bearer ${idToken}`,
         },
-        body: JSON.stringify({ to: selectedId, mode: "text", message: reply }),
+        body: JSON.stringify({ conversationId: selectedId, ...body }),
       });
       const data = (await res.json().catch(() => ({}))) as { error?: string };
       if (!res.ok) {
-        toast(data.error ?? "Could not send reply.", "error");
-        return;
+        toast(data.error ?? "Could not send.", "error");
+        return false;
       }
-      setReply("");
+      return true;
     } catch {
       toast("Network error. Try again.", "error");
+      return false;
     } finally {
       setSending(false);
     }
   }
 
-  if (!ready) {
-    return (
-      <div className="flex min-h-full flex-1 items-center justify-center">
-        <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
-      </div>
-    );
+  async function handleReply(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!reply.trim()) return;
+    if (await sendToSelected({ mode: "text", message: reply })) setReply("");
+  }
+
+  async function handleTemplate(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!templateName.trim()) return;
+    const sent = await sendToSelected({
+      mode: "template",
+      templateName: templateName.trim(),
+      templateLanguage: templateLanguage.trim() || "en_US",
+    });
+    if (sent) toast("Template sent.", "success");
   }
 
   return (
@@ -344,19 +365,19 @@ export default function InboxPage() {
             <ul className="divide-y divide-black/[0.06] dark:divide-white/[0.08]">
               {conversations.map((c) => {
                 const unread = c.unreadCount ?? 0;
-                const active = c.waId === selectedId;
+                const active = c.id === selectedId;
                 return (
-                  <li key={c.waId}>
+                  <li key={c.id}>
                     <button
                       type="button"
-                      onClick={() => selectConversation(c.waId)}
+                      onClick={() => selectConversation(c.id)}
                       className={`flex w-full flex-col gap-1 px-4 py-3 text-left transition hover:bg-zinc-50 dark:hover:bg-zinc-900 ${
                         active ? "bg-zinc-100 dark:bg-zinc-900" : ""
                       }`}
                     >
                       <div className="flex items-center justify-between gap-2">
                         <span className="truncate text-sm font-medium text-zinc-900 dark:text-zinc-100">
-                          {c.name || `+${c.waId}`}
+                          {customerLabel(c)}
                         </span>
                         <span className="shrink-0 text-[11px] text-zinc-400">
                           {formatTime(c.lastMessageAt)}
@@ -407,11 +428,33 @@ export default function InboxPage() {
                 </button>
                 <div>
                   <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-                    {selected.name || `+${selected.waId}`}
+                    {customerLabel(selected)}
                   </p>
-                  <p className="text-[11px] text-zinc-400">+{selected.waId}</p>
+                  <p className="text-[11px] text-zinc-400">{customerDetail(selected)}</p>
                 </div>
               </div>
+
+              {typeof selected.continuedIn === "string" && (
+                <div className="flex flex-wrap items-center gap-2 border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/40 dark:text-amber-300">
+                  <span>This customer changed their WhatsApp number and now writes from another conversation.</span>
+                  {conversations.some((c) => c.id === selected.continuedIn) && (
+                    <button
+                      type="button"
+                      onClick={() => void selectConversation(selected.continuedIn as string)}
+                      className="font-medium underline"
+                    >
+                      Open it
+                    </button>
+                  )}
+                </div>
+              )}
+              {toMillis(selected.numberReassignedAt) !== undefined && (
+                <p className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/40 dark:text-amber-300">
+                  Since {formatTime(selected.numberReassignedAt)}, this customer&apos;s old number
+                  belongs to a different WhatsApp account, which has its own conversation.
+                  Replies here no longer go to that number.
+                </p>
+              )}
 
               <div className="flex-1 space-y-2 overflow-y-auto px-4 py-4">
                 {messages.map((m) => {
@@ -437,12 +480,12 @@ export default function InboxPage() {
                         }`}
                       >
                         <MessageBody
-                          conversationId={selected.waId}
+                          conversationId={selected.id}
                           message={edit ? applyEdit(m, edit) : m}
                           quoted={
                             quoted ? (quotedEdit ? applyEdit(quoted, quotedEdit) : quoted) : null
                           }
-                          customerLabel={selected.name || `+${selected.waId}`}
+                          customerLabel={customerLabel(selected)}
                           sentAtMs={toMillis(m.timestamp)}
                           deleted={thread.deleted.has(m.id)}
                         />
@@ -484,40 +527,71 @@ export default function InboxPage() {
                 <div ref={threadEndRef} />
               </div>
 
-              <form
-                onSubmit={handleReply}
-                className="border-t border-black/[0.08] px-4 py-3 dark:border-white/[0.12]"
-              >
-                {!windowOpen && (
-                  <p className="mb-2 text-xs text-amber-600 dark:text-amber-400">
-                    The 24-hour reply window is closed. Free-form text will be
-                    rejected by WhatsApp — use an approved template from the{" "}
-                    <Link href="/admin/dashboard" className="underline">
-                      Send
-                    </Link>{" "}
-                    page instead.
+              {typeof selected.continuedIn === "string" ? (
+                <p className="border-t border-black/[0.08] px-4 py-3 text-xs text-zinc-500 dark:border-white/[0.12] dark:text-zinc-400">
+                  Reply in the customer&apos;s new conversation.
+                </p>
+              ) : windowOpen ? (
+                <form
+                  onSubmit={handleReply}
+                  className="border-t border-black/[0.08] px-4 py-3 dark:border-white/[0.12]"
+                >
+                  <div className="flex items-end gap-2">
+                    <textarea
+                      rows={1}
+                      value={reply}
+                      onChange={(e) => setReply(e.target.value)}
+                      placeholder="Type a reply…"
+                      disabled={sending}
+                      className="max-h-32 flex-1 resize-y rounded-2xl border border-zinc-300 bg-transparent px-3 py-2 text-sm outline-none ring-zinc-400 placeholder:text-zinc-400 focus:ring-2 disabled:opacity-60 dark:border-zinc-600"
+                    />
+                    <button
+                      type="submit"
+                      disabled={sending || !reply.trim()}
+                      className="flex h-10 shrink-0 items-center justify-center rounded-full bg-foreground px-4 text-sm font-medium text-background transition-opacity disabled:opacity-50"
+                    >
+                      {sending ? "…" : "Send"}
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <form
+                  onSubmit={handleTemplate}
+                  className="space-y-2 border-t border-black/[0.08] px-4 py-3 dark:border-white/[0.12]"
+                >
+                  <p className="text-xs text-amber-600 dark:text-amber-400">
+                    The 24-hour reply window is closed, so WhatsApp only accepts an
+                    approved template. Enter its exact name and language code.
                   </p>
-                )}
-                <div className="flex items-end gap-2">
-                  <textarea
-                    rows={1}
-                    value={reply}
-                    onChange={(e) => setReply(e.target.value)}
-                    placeholder={
-                      windowOpen ? "Type a reply…" : "Reply window closed"
-                    }
-                    disabled={sending || !windowOpen}
-                    className="max-h-32 flex-1 resize-y rounded-2xl border border-zinc-300 bg-transparent px-3 py-2 text-sm outline-none ring-zinc-400 placeholder:text-zinc-400 focus:ring-2 disabled:opacity-60 dark:border-zinc-600"
-                  />
-                  <button
-                    type="submit"
-                    disabled={sending || !windowOpen || !reply.trim()}
-                    className="flex h-10 shrink-0 items-center justify-center rounded-full bg-foreground px-4 text-sm font-medium text-background transition-opacity disabled:opacity-50"
-                  >
-                    {sending ? "…" : "Send"}
-                  </button>
-                </div>
-              </form>
+                  <div className="flex flex-wrap items-end gap-2">
+                    <input
+                      type="text"
+                      value={templateName}
+                      onChange={(e) => setTemplateName(e.target.value)}
+                      placeholder="template_name"
+                      aria-label="Template name"
+                      disabled={sending}
+                      className="min-w-0 flex-1 rounded-2xl border border-zinc-300 bg-transparent px-3 py-2 text-sm outline-none ring-zinc-400 placeholder:text-zinc-400 focus:ring-2 disabled:opacity-60 dark:border-zinc-600"
+                    />
+                    <input
+                      type="text"
+                      value={templateLanguage}
+                      onChange={(e) => setTemplateLanguage(e.target.value)}
+                      placeholder="en_US"
+                      aria-label="Template language code"
+                      disabled={sending}
+                      className="w-24 rounded-2xl border border-zinc-300 bg-transparent px-3 py-2 text-sm outline-none ring-zinc-400 placeholder:text-zinc-400 focus:ring-2 disabled:opacity-60 dark:border-zinc-600"
+                    />
+                    <button
+                      type="submit"
+                      disabled={sending || !templateName.trim()}
+                      className="flex h-10 shrink-0 items-center justify-center rounded-full bg-foreground px-4 text-sm font-medium text-background transition-opacity disabled:opacity-50"
+                    >
+                      {sending ? "…" : "Send template"}
+                    </button>
+                  </div>
+                </form>
+              )}
             </>
           )}
         </section>

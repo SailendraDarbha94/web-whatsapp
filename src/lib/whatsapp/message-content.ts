@@ -130,8 +130,12 @@ export type SystemContent = {
   /** e.g. "user_changed_number" or "user_changed_user_id". */
   systemType?: string;
   body?: string;
-  /** user_changed_number: the customer's new WhatsApp id. */
+  /** user_changed_number (and user_changed_user_id, when shareable): the customer's new WhatsApp id. */
   newWaId?: string;
+  /** user_changed_user_id: the customer's new business-scoped user id. */
+  userId?: string;
+  /** user_changed_user_id: the business-scoped user id they had before. */
+  previousUserId?: string;
 };
 
 /** Something WhatsApp can't deliver through the API, e.g. a poll. */

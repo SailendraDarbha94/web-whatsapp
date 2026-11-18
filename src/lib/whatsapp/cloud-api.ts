@@ -1,24 +1,61 @@
+import { isUserId } from "@/lib/whatsapp/ids";
+
+/**
+ * Who a message goes to: a phone number (digits with country code), or the
+ * business-scoped user id of a customer who hasn't shared their number.
+ */
+export type WhatsAppRecipient =
+  | { kind: "phone"; digits: string }
+  | { kind: "user"; userId: string };
+
 export type SendWhatsAppPayload =
   | {
       mode: "text";
-      to: string;
+      recipient: WhatsAppRecipient;
       body: string;
     }
   | {
       mode: "template";
-      to: string;
+      recipient: WhatsAppRecipient;
       templateName: string;
       templateLanguage: string;
     };
 
+const INTERNATIONAL_HINT = "Start with + and the country code, for example +44 7700 900123.";
+
+/**
+ * A recipient an operator typed: a BSUID, or a number in international
+ * format ("+44 7700 900123" or "0044 7700 900123"). Numbers without "+" or
+ * "00" are refused rather than guessed: a national number such as
+ * "(479) 555-0123" would otherwise be read as +47 and reach someone in
+ * another country. Throws "Invalid phone number…".
+ */
+export function parseTypedRecipient(input: string): WhatsAppRecipient {
+  // Pasted numbers often carry invisible direction marks or a full-width "＋".
+  const value = input.normalize("NFKC").replace(/\p{Cf}/gu, "").trim();
+  if (isUserId(value)) return { kind: "user", userId: value };
+  if (!value.startsWith("+") && !value.startsWith("00")) {
+    throw new Error(`Invalid phone number. ${INTERNATIONAL_HINT}`);
+  }
+  return { kind: "phone", digits: normalizeWhatsAppTo(value) };
+}
+
+/** Digits of an international number ("+44 7700 900123", "0044…" → "447700900123"). */
 export function normalizeWhatsAppTo(input: string): string {
-  const digits = input.replace(/\D/g, "");
-  if (digits.length < 8 || digits.length > 15) {
-    throw new Error(
-      "Invalid phone number. Include country code (8–15 digits after normalization)."
-    );
+  const trimmed = input.trim();
+  let digits = trimmed.replace(/\D/g, "");
+  // "00" is the international dialling prefix in most countries.
+  if (!trimmed.startsWith("+") && digits.startsWith("00")) digits = digits.slice(2);
+  // No country code starts with 0, and the length must fit E.164.
+  if (digits.startsWith("0") || digits.length < 8 || digits.length > 15) {
+    throw new Error(`Invalid phone number. ${INTERNATIONAL_HINT}`);
   }
   return digits;
+}
+
+/** How a recipient is written for people: "+447700900123", or the BSUID. */
+export function formatRecipient(recipient: WhatsAppRecipient): string {
+  return recipient.kind === "phone" ? `+${recipient.digits}` : recipient.userId;
 }
 
 function readWhatsAppConfig(): {
@@ -44,12 +81,15 @@ function readWhatsAppConfig(): {
 
 export async function sendWhatsAppMessage(payload: SendWhatsAppPayload) {
   const { version, phoneNumberId, token } = readWhatsAppConfig();
-
-  const to = normalizeWhatsAppTo(payload.to);
+  const { recipient } = payload;
 
   const graphBody: Record<string, unknown> = {
     messaging_product: "whatsapp",
-    to,
+    // Always "+" and country code: without the "+", Meta may prepend this
+    // business number's own country code and deliver to someone else.
+    ...(recipient.kind === "phone"
+      ? { to: formatRecipient(recipient) }
+      : { recipient: recipient.userId }),
     type: payload.mode,
   };
 
@@ -107,9 +147,10 @@ type GraphResponse = {
   messages?: unknown;
 };
 
-type GraphSuccessResponse = {
+export type GraphSuccessResponse = {
   messaging_product?: string;
-  contacts?: unknown;
+  /** `wa_id` is the WhatsApp id Meta resolved the number to; it keys the conversation. */
+  contacts?: { input?: string; wa_id?: string; user_id?: string }[];
   messages?: { id?: string }[];
 };
 
@@ -326,7 +367,7 @@ function formatGraphError(data: GraphResponse | null, httpStatus: number): strin
   ) {
     return (
       "WhatsApp API rejected the access token (WHATSAPP_ACCESS_TOKEN). " +
-      "In Meta for Developers, open your app → WhatsApp → API setup: use a current System User or temporary token with whatsapp_business_messaging, " +
+      "Use a System User token (Business settings → System users) that has the app and this number's WhatsApp accounts assigned, with whatsapp_business_messaging and whatsapp_business_management, " +
       "and ensure WHATSAPP_PHONE_NUMBER_ID is the 'Phone number ID' for that WhatsApp Business account." +
       (metaDetail ? ` Meta said: ${metaDetail}.` : "")
     ).trim();

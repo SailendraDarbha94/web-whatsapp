@@ -1,44 +1,32 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { onAuthStateChanged, signOut } from "firebase/auth";
+import { signOut } from "firebase/auth";
 import { getFirebaseAuth } from "@/lib/firebase/firebaseConfig";
 import { useToast } from "@/contexts/toast-context";
+import { OperatorGate } from "@/components/admin/session-gate";
 
 type SendMode = "text" | "template";
 
 export default function AdminDashboardPage() {
+  return (
+    <OperatorGate>
+      <SendPage />
+    </OperatorGate>
+  );
+}
+
+function SendPage() {
   const router = useRouter();
   const { toast } = useToast();
-  const [ready, setReady] = useState(false);
   const [phone, setPhone] = useState("");
   const [message, setMessage] = useState("");
   const [sendMode, setSendMode] = useState<SendMode>("template");
-  const [templateName, setTemplateName] = useState("hello_world");
+  const [templateName, setTemplateName] = useState("");
   const [templateLanguage, setTemplateLanguage] = useState("en_US");
   const [sending, setSending] = useState(false);
-
-  useEffect(() => {
-    let auth;
-    try {
-      auth = getFirebaseAuth();
-    } catch {
-      router.replace("/admin/login");
-      return;
-    }
-
-    const unsub = onAuthStateChanged(auth, (user) => {
-      if (!user) {
-        router.replace("/admin/login");
-        return;
-      }
-      setReady(true);
-    });
-
-    return () => unsub();
-  }, [router]);
 
   async function handleSignOut() {
     try {
@@ -73,7 +61,7 @@ export default function AdminDashboardPage() {
           : {
               to: phone,
               mode: "template" as const,
-              templateName: templateName.trim() || "hello_world",
+              templateName: templateName.trim(),
               templateLanguage: templateLanguage.trim() || "en_US",
             };
 
@@ -89,6 +77,7 @@ export default function AdminDashboardPage() {
       const data = (await res.json().catch(() => ({}))) as {
         error?: string;
         ok?: boolean;
+        to?: string;
       };
 
       if (!res.ok) {
@@ -96,7 +85,8 @@ export default function AdminDashboardPage() {
         return;
       }
 
-      toast("Message sent.", "success");
+      // Show the number as WhatsApp got it, so a wrong country code is noticed.
+      toast(data.to ? `Message sent to ${data.to}.` : "Message sent.", "success");
       if (sendMode === "text") {
         setMessage("");
       }
@@ -105,14 +95,6 @@ export default function AdminDashboardPage() {
     } finally {
       setSending(false);
     }
-  }
-
-  if (!ready) {
-    return (
-      <div className="flex min-h-full flex-1 items-center justify-center">
-        <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
-      </div>
-    );
   }
 
   return (
@@ -154,7 +136,8 @@ export default function AdminDashboardPage() {
           <strong className="font-medium text-zinc-800 dark:text-zinc-200">
             Template
           </strong>{" "}
-          — for cold outreach using approved templates.{" "}
+          — an approved template, to start a conversation with a customer who
+          agreed to hear from you, or after the 24-hour reply window closes.{" "}
           <strong className="font-medium text-zinc-800 dark:text-zinc-200">
             Free-form text
           </strong>{" "}
@@ -200,7 +183,7 @@ export default function AdminDashboardPage() {
               type="tel"
               inputMode="tel"
               autoComplete="tel"
-              placeholder="+1 555 123 4567"
+              placeholder="+44 7700 900123"
               value={phone}
               onChange={(e) => setPhone(e.target.value)}
               required
@@ -208,7 +191,8 @@ export default function AdminDashboardPage() {
               className="rounded-xl border border-zinc-300 bg-transparent px-3 py-2.5 text-[15px] font-normal outline-none ring-zinc-400 placeholder:text-zinc-400 focus:ring-2 disabled:opacity-60 dark:border-zinc-600"
             />
             <span className="text-xs font-normal text-zinc-500 dark:text-zinc-500">
-              Include country code (digits only are sent to WhatsApp).
+              Required: + and the country code, e.g. +1 479 555 0123 or +44 7700
+              900123. Numbers without it are refused, not guessed.
             </span>
           </label>
 
@@ -221,7 +205,8 @@ export default function AdminDashboardPage() {
                   value={templateName}
                   onChange={(e) => setTemplateName(e.target.value)}
                   disabled={sending}
-                  placeholder="hello_world"
+                  required
+                  placeholder="order_update"
                   className="rounded-xl border border-zinc-300 bg-transparent px-3 py-2.5 text-[15px] font-normal outline-none ring-zinc-400 focus:ring-2 disabled:opacity-60 dark:border-zinc-600"
                 />
               </label>
